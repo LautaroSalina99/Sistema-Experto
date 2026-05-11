@@ -1,3 +1,7 @@
+/**
+ * Interfaz web del sistema experto: formulario de memoria de trabajo, llamada a la API
+ * y pestaña XAI con ruta de inferencia, explicación en prosa y tabla de reglas.
+ */
 import * as Tabs from '@radix-ui/react-tabs'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
@@ -33,6 +37,13 @@ export type MemoriaTrabajoPayload = {
   informacion_completa: boolean
 }
 
+export type ReglaActivada = {
+  codigo: string
+  categoria: 'informacion' | 'corte_prioritario' | 'difusa_mamdani' | 'trazabilidad_dominio' | 'postproceso_numerico'
+  descripcion: string
+  grado_activacion: number | null
+}
+
 export type EvaluacionResultado = {
   aptitud_preliminar: string
   nivel_riesgo: 'bajo' | 'medio' | 'alto'
@@ -40,6 +51,8 @@ export type EvaluacionResultado = {
   recomendacion: string
   derivacion_sugerida: string
   reglas_activadas: string[]
+  reglas_explicadas: ReglaActivada[]
+  explicacion_conclusion: string
 }
 
 type InferenceStep = {
@@ -114,7 +127,9 @@ function buildInferenceSteps(
   const rulesCritical = ['R2', 'R3', 'R4', 'R5', 'R6', 'R7']
   const hitCritical = rulesCritical.some((r) => reglas.includes(r))
   const hitR1 = reglas.includes('R1')
-  const hitFuzzy = reglas.some((r) => r.includes('Fase3') || r.includes('difuso'))
+  const hitFuzzy = reglas.some(
+    (r) => r.includes('Fase3') || r.includes('difuso') || r.startsWith('DF'),
+  )
   const moderateCodes = [
     'R8',
     'R9',
@@ -195,6 +210,7 @@ function ruleChipClass(rule: string): string {
   if (/^R[2-7]$/.test(rule)) return 'border-red-200 bg-red-50 text-red-800'
   if (rule === 'R1') return 'border-slate-300 bg-slate-100 text-slate-800'
   if (rule === 'R21' || rule === 'R22') return 'border-amber-300 bg-amber-50 text-amber-900'
+  if (rule.startsWith('DF')) return 'border-violet-200 bg-violet-50 text-violet-900'
   if (rule.includes('Fase') || rule.includes('difuso'))
     return 'border-indigo-200 bg-indigo-50 text-indigo-900'
   return 'border-sky-200 bg-sky-50 text-sky-900'
@@ -712,6 +728,51 @@ export default function App() {
                       </li>
                     ))}
                   </ol>
+                </div>
+
+                <div className="rounded-2xl border border-emerald-100 bg-emerald-50/50 p-6 shadow-sm ring-1 ring-emerald-100">
+                  <h2 className="text-lg font-semibold text-slate-900">¿Por qué esta conclusión?</h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Resumen en prosa generado por el subsistema de explicación del backend.
+                  </p>
+                  <p className="mt-3 text-sm leading-relaxed text-slate-800">
+                    {result?.explicacion_conclusion?.trim()
+                      ? result.explicacion_conclusion
+                      : 'Ejecute una evaluación para ver la justificación. Si el campo viene vacío, actualice la API a la última versión.'}
+                  </p>
+                </div>
+
+                <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                  <h2 className="text-lg font-semibold text-slate-900">Reglas explicadas (estructura)</h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Cada fila enlaza un código con su propósito; las reglas Mamdani incluyen el grado de activación del
+                    antecedente.
+                  </p>
+                  <table className="mt-4 w-full min-w-[32rem] text-left text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-200 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        <th className="py-2 pr-3">Código</th>
+                        <th className="py-2 pr-3">Tipo</th>
+                        <th className="py-2 pr-3">Grado</th>
+                        <th className="py-2">Descripción</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(result?.reglas_explicadas ?? []).map((row) => (
+                        <tr key={`${row.codigo}-${row.categoria}`} className="border-b border-slate-100 align-top">
+                          <td className="py-2 pr-3 font-mono text-xs text-slate-900">{row.codigo}</td>
+                          <td className="py-2 pr-3 text-xs text-slate-600">{row.categoria}</td>
+                          <td className="py-2 pr-3 text-xs tabular-nums text-slate-700">
+                            {row.grado_activacion != null ? row.grado_activacion.toFixed(3) : '—'}
+                          </td>
+                          <td className="py-2 text-slate-700">{row.descripcion}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {result && (result.reglas_explicadas?.length ?? 0) === 0 ? (
+                    <p className="mt-2 text-sm text-amber-800">La API no devolvió filas estructuradas.</p>
+                  ) : null}
                 </div>
 
                 <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">

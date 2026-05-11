@@ -1,8 +1,12 @@
 """
-Sistema Experto híbrido (reglas + lógica difusa) para evaluación preliminar
+Sistema Experto híbrido (reglas duras + lógica difusa) para evaluación preliminar
 de aptitud/riesgo en cirugía estética corporal — según TP2 documentado.
 
-Ejecución: uvicorn main:app --reload
+Incluye un subsistema de explicación básico: cada respuesta expone qué reglas
+participaron (dominio R1–R22, motor difuso DF01–DF25 con grado de activación) y
+un texto «por qué» en ``explicacion_conclusion``.
+
+Ejecución: ``python -m uvicorn main:app --reload`` o ``run.bat`` en Windows.
 """
 
 from __future__ import annotations
@@ -15,6 +19,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from skfuzzy import control as ctrl
+
+from explicacion_reglas import (
+    descripcion_difusa,
+    descripcion_dominio,
+    disparos_difusos_desde_simulacion,
+)
 
 # --- Constantes de dominio (literales del documento) ---
 
@@ -36,7 +46,12 @@ NivelRiesgoCat = Literal["bajo", "medio", "alto"]
 
 
 class MemoriaTrabajo(BaseModel):
-    """Memoria de trabajo: hechos del paciente (entrada API)."""
+    """
+    Memoria de trabajo: hechos del paciente tal como los ingresa la API.
+
+    Los escalares 1–10 siguen la semántica del informe (mayor es mejor salvo
+    donde se documente lo contrario, p. ej. estabilidad del peso).
+    """
 
     edad: int = Field(..., ge=0, le=120)
     procedimiento_deseado: Procedimiento
@@ -53,6 +68,27 @@ class MemoriaTrabajo(BaseModel):
     informacion_completa: bool
 
 
+class ReglaActivada(BaseModel):
+    """
+    Elemento del subsistema de explicación: identifica una regla que influyó
+    en la decisión y ofrece lenguaje natural para trazabilidad clínica.
+    """
+
+    codigo: str
+    categoria: Literal[
+        "informacion",
+        "corte_prioritario",
+        "difusa_mamdani",
+        "trazabilidad_dominio",
+        "postproceso_numerico",
+    ]
+    descripcion: str
+    grado_activacion: float | None = Field(
+        default=None,
+        description="Grado de disparo Mamdani del antecedente (solo reglas difusas).",
+    )
+
+
 class EvaluacionResultado(BaseModel):
     aptitud_preliminar: Aptitud
     nivel_riesgo: NivelRiesgoCat
@@ -60,6 +96,14 @@ class EvaluacionResultado(BaseModel):
     recomendacion: str
     derivacion_sugerida: str
     reglas_activadas: list[str]
+    reglas_explicadas: list[ReglaActivada] = Field(
+        default_factory=list,
+        description="Lista ordenada de reglas con texto explicativo y, si aplica, grado difuso.",
+    )
+    explicacion_conclusion: str = Field(
+        default="",
+        description="Resumen en prosa que responde: ¿por qué el sistema llegó a esta conclusión?",
+    )
 
 
 app = FastAPI(
@@ -113,8 +157,10 @@ def _expectativas_a_escala(exp: Expectativas) -> float:
 
 def _construir_sistema_difuso() -> ctrl.ControlSystemSimulation:
     """
-    Variables y funciones de membresía EXACTAS según 'Funciones de membresía propuestas'.
-    Salida: Nivel de riesgo 0–100 (bajo/medio/alto).
+    Construye antecedentes, consecuente, funciones de membresía y la base de reglas Mamdani.
+
+    Cada ``ctrl.Rule`` incluye ``label`` único (DF01–DF25) para enlazar con textos en
+    ``explicacion_reglas`` y reportar grados de disparo tras ``compute()``.
     """
     # Universos
     edad = ctrl.Antecedent(np.arange(18, 81, 1), "edad")
@@ -176,10 +222,10 @@ def _construir_sistema_difuso() -> ctrl.ControlSystemSimulation:
     proc_abdom["no"] = fuzz.trapmf(proc_abdom.universe, [0, 0, 0.05, 0.45])
     proc_abdom["si"] = fuzz.trapmf(proc_abdom.universe, [0.55, 0.95, 1, 1])
 
-    # ========== Reglas difusas: antecedentes → consecuente riesgo ==========
-    # Fase 3–5: combinaciones que reflejan R8–R18 y tablas del dominio.
+    # ========== Reglas difusas Mamdani (DF01–DF25): antecedentes → riesgo ==========
+    # Cada regla lleva ``label`` único para el subsistema de explicación (grados de disparo).
     rules: list[ctrl.Rule] = [
-        # Perfil favorable (R19-like, sin factores críticos ya filtrados)
+        # --- Bloque «perfil favorable»: empuja riesgo bajo si todo el conjunto encaja ---
         ctrl.Rule(
             imc["normal"]
             & salud["bueno"]
@@ -190,46 +236,57 @@ def _construir_sistema_difuso() -> ctrl.ControlSystemSimulation:
             & complicaciones_qx["no"]
             & cicatriz_mala["no"],
             riesgo["bajo"],
+            label="DF01",
         ),
-        # IMC bajo: requiere evaluación; riesgo al menos medio
-        ctrl.Rule(imc["bajo"], riesgo["medio"]),
-        ctrl.Rule(imc["moderadamente_elevado"], riesgo["medio"]),
-        ctrl.Rule(imc["elevado"], riesgo["alto"]),
-        ctrl.Rule(imc["muy_elevado"], riesgo["alto"]),
-        # Estabilidad del peso
-        ctrl.Rule(estabilidad["poco_estable"], riesgo["medio"]),
-        ctrl.Rule(estabilidad["inestable"], riesgo["alto"]),
-        # Salud y expectativas graduales (Fase 3); 'malo' suele cortarse en R7
-        ctrl.Rule(salud["regular"], riesgo["medio"]),
-        ctrl.Rule(expectativas["poco_claras"], riesgo["medio"]),
-        # Edad mayor aporta más riesgo si no todo es óptimo
-        ctrl.Rule(edad["adulto_mayor"] & salud["bueno"] & imc["normal"], riesgo["medio"]),
-        ctrl.Rule(edad["adulto_mayor"] & (imc["moderadamente_elevado"] | imc["elevado"]), riesgo["alto"]),
-        ctrl.Rule(edad["adulto_mayor"] & salud["regular"], riesgo["alto"]),
-        # Tabaquismo R8
-        ctrl.Rule(tabaco["si"], riesgo["medio"]),
-        ctrl.Rule(tabaco["si"] & (imc["elevado"] | imc["muy_elevado"]), riesgo["alto"]),
-        ctrl.Rule(tabaco["si"] & estabilidad["inestable"], riesgo["alto"]),
-        # Antecedentes R13 / cicatriz R14
-        ctrl.Rule(complicaciones_qx["si"], riesgo["medio"]),
-        ctrl.Rule(complicaciones_qx["si"] & (imc["elevado"] | imc["muy_elevado"]), riesgo["alto"]),
-        ctrl.Rule(cicatriz_mala["si"], riesgo["medio"]),
-        ctrl.Rule(cicatriz_mala["si"] & estabilidad["inestable"], riesgo["alto"]),
-        # Procedimiento abdominoplastía + factores corporales (R17–R18)
-        ctrl.Rule(proc_abdom["si"] & estabilidad["inestable"], riesgo["alto"]),
-        ctrl.Rule(proc_abdom["si"] & cicatriz_mala["si"], riesgo["alto"]),
-        # Estado psicológico dudoso R15 → condiciones / riesgo medio+
-        ctrl.Rule(salud["regular"] & expectativas["poco_claras"], riesgo["medio"]),
-        # Acumulación de varios factores moderados (refuerzo R20–R22 vía reglas)
+        # --- Bloque IMC: clases documentadas de delgadez a obesidad severa ---
+        ctrl.Rule(imc["bajo"], riesgo["medio"], label="DF02"),
+        ctrl.Rule(imc["moderadamente_elevado"], riesgo["medio"], label="DF03"),
+        ctrl.Rule(imc["elevado"], riesgo["alto"], label="DF04"),
+        ctrl.Rule(imc["muy_elevado"], riesgo["alto"], label="DF05"),
+        # --- Bloque estabilidad ponderal (escala 0–10 difusa) ---
+        ctrl.Rule(estabilidad["poco_estable"], riesgo["medio"], label="DF06"),
+        ctrl.Rule(estabilidad["inestable"], riesgo["alto"], label="DF07"),
+        # --- Bloque salud / expectativas graduales (Fase 3); «malo» se filtra antes por R7 ---
+        ctrl.Rule(salud["regular"], riesgo["medio"], label="DF08"),
+        ctrl.Rule(expectativas["poco_claras"], riesgo["medio"], label="DF09"),
+        # --- Bloque edad adulta mayor: refina riesgo aun con subconjuntos «buenos» ---
+        ctrl.Rule(edad["adulto_mayor"] & salud["bueno"] & imc["normal"], riesgo["medio"], label="DF10"),
+        ctrl.Rule(
+            edad["adulto_mayor"] & (imc["moderadamente_elevado"] | imc["elevado"]),
+            riesgo["alto"],
+            label="DF11",
+        ),
+        ctrl.Rule(edad["adulto_mayor"] & salud["regular"], riesgo["alto"], label="DF12"),
+        # --- Bloque tabaquismo (antecedente binario difusificado, coherente con R8) ---
+        ctrl.Rule(tabaco["si"], riesgo["medio"], label="DF13"),
+        ctrl.Rule(tabaco["si"] & (imc["elevado"] | imc["muy_elevado"]), riesgo["alto"], label="DF14"),
+        ctrl.Rule(tabaco["si"] & estabilidad["inestable"], riesgo["alto"], label="DF15"),
+        # --- Bloque antecedentes quirúrgicos y cicatrización (R13–R14 en dominio) ---
+        ctrl.Rule(complicaciones_qx["si"], riesgo["medio"], label="DF16"),
+        ctrl.Rule(
+            complicaciones_qx["si"] & (imc["elevado"] | imc["muy_elevado"]),
+            riesgo["alto"],
+            label="DF17",
+        ),
+        ctrl.Rule(cicatriz_mala["si"], riesgo["medio"], label="DF18"),
+        ctrl.Rule(cicatriz_mala["si"] & estabilidad["inestable"], riesgo["alto"], label="DF19"),
+        # --- Bloque procedimiento abdominal (R17–R18) ---
+        ctrl.Rule(proc_abdom["si"] & estabilidad["inestable"], riesgo["alto"], label="DF20"),
+        ctrl.Rule(proc_abdom["si"] & cicatriz_mala["si"], riesgo["alto"], label="DF21"),
+        # --- Bloque refuerzo salud + expectativas ambiguas (relacionado con R15–R16) ---
+        ctrl.Rule(salud["regular"] & expectativas["poco_claras"], riesgo["medio"], label="DF22"),
+        # --- Bloque acumulación de moderados (refuerzo numérico alineado con R20–R22) ---
         ctrl.Rule(
             tabaco["si"] & estabilidad["poco_estable"] & salud["regular"],
             riesgo["alto"],
+            label="DF23",
         ),
         ctrl.Rule(
             imc["moderadamente_elevado"] & estabilidad["poco_estable"] & tabaco["si"],
             riesgo["alto"],
+            label="DF24",
         ),
-        ctrl.Rule(complicaciones_qx["si"] & cicatriz_mala["si"], riesgo["alto"]),
+        ctrl.Rule(complicaciones_qx["si"] & cicatriz_mala["si"], riesgo["alto"], label="DF25"),
     ]
 
     sistema = ctrl.ControlSystem(rules)
@@ -240,6 +297,12 @@ _SISTEMA_CACHE: ctrl.ControlSystemSimulation | None = None
 
 
 def _obtener_simulacion() -> ctrl.ControlSystemSimulation:
+    """
+    Devuelve la simulación del sistema difuso, construyéndola una sola vez (caché).
+
+    Tras cambiar etiquetas o reglas en ``_construir_sistema_difuso``, reinicie
+    el proceso del servidor para forzar la reconstrucción.
+    """
     global _SISTEMA_CACHE
     if _SISTEMA_CACHE is None:
         _SISTEMA_CACHE = _construir_sistema_difuso()
@@ -307,11 +370,80 @@ def _clasificacion_aptitud_sin_criticos(
     return "apto con condiciones"
 
 
+def _orden_codigo_regla(codigo: str) -> tuple:
+    """
+    Ordena etiquetas para la salida humana: primero la fase del motor, luego DF
+    numéricas y finalmente las R del documento.
+    """
+    if codigo.startswith("Fase"):
+        return (0, codigo)
+    if codigo.startswith("DF") and len(codigo) > 2 and codigo[2:].isdigit():
+        return (1, int(codigo[2:]))
+    if codigo.startswith("R") and codigo[1:].isdigit():
+        return (2, int(codigo[1:]))
+    return (3, codigo)
+
+
+def _regla_activada_corte_domino(codigo: str) -> ReglaActivada:
+    """Arma el objeto explicativo para reglas duras de las Fases 1 y 2 (R1–R7)."""
+    if codigo == "R1":
+        return ReglaActivada(
+            codigo=codigo,
+            categoria="informacion",
+            descripcion=descripcion_dominio(codigo),
+        )
+    return ReglaActivada(
+        codigo=codigo,
+        categoria="corte_prioritario",
+        descripcion=descripcion_dominio(codigo),
+    )
+
+
+def _explicacion_texto_corte(codigo: str, aptitud: Aptitud, nivel: NivelRiesgoCat) -> str:
+    """Genera el párrafo «por qué» cuando el motor se detiene en R1 o R2–R7."""
+    base = descripcion_dominio(codigo)
+    if codigo == "R1":
+        return (
+            f"La salida «{aptitud}» corresponde a la regla R1: {base} "
+            "No se invoca el bloque difuso hasta completar la memoria de trabajo."
+        )
+    return (
+        f"La salida «{aptitud}» con riesgo {nivel} corresponde a la regla prioritaria {codigo}: {base} "
+        "Estas exclusiones se evalúan antes que las reglas Mamdani de riesgo gradual."
+    )
+
+
+def _explicacion_texto_difuso(
+    aptitud: Aptitud,
+    nivel: NivelRiesgoCat,
+    riesgo_ajustado: float,
+    moderados: int,
+    disparos: list[tuple[str, float]],
+    codigos_traza: list[str],
+) -> str:
+    """Genera el párrafo «por qué» cuando participa la defuzzificación y las trazas R8–R22."""
+    principales = ", ".join(f"{c} (activación {g:.2f})" for c, g in disparos[:7])
+    sufijo = " …" if len(disparos) > 7 else ""
+    traza_txt = ", ".join(codigos_traza) if codigos_traza else "sin códigos R de trazabilidad"
+    return (
+        "No se activaron exclusiones inmediatas (R2–R7). "
+        f"El subsistema difuso aportó principalmente: {principales}{sufijo}. "
+        f"El postproceso por conteo de factores moderados (R21–R22) con valor {moderados} ajustó el riesgo "
+        f"a {riesgo_ajustado:.1f}/100, categoría «{nivel}» y por tanto «{aptitud}». "
+        f"Referencias explícitas de dominio en este caso: {traza_txt}."
+    )
+
+
 def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
+    """
+    Punto de entrada del razonamiento: encadenamiento hacia adelante en tres capas
+    (información, reglas críticas, motor difuso + trazas) y construcción del subsistema
+    de explicación para auditoría clínica o académica.
+    """
     reglas: list[str] = []
     recomendaciones: list[str] = []
 
-    # ----- Fase 1: R1 -----
+    # ----- Fase 1: R1 (información incompleta bloquea el resto del motor) -----
     if not mt.informacion_completa:
         reglas.append("R1")
         return EvaluacionResultado(
@@ -322,9 +454,11 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             "Solicite más información antes de continuar.",
             derivacion_sugerida="ninguna",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R1")],
+            explicacion_conclusion=_explicacion_texto_corte("R1", "requiere mayor información", "medio"),
         )
 
-    # ----- Fase 2: R2–R7 (reglas críticas; prioridad inmediata) -----
+    # ----- Fase 2: R2–R7 (cortes duros conclusivos antes del difuso) -----
     if mt.edad < 18:
         reglas.append("R2")
         return EvaluacionResultado(
@@ -335,6 +469,8 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             "con esta evaluación automatizada.",
             derivacion_sugerida="ninguna",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R2")],
+            explicacion_conclusion=_explicacion_texto_corte("R2", "no apto preliminarmente", "alto"),
         )
 
     if mt.enfermedad_no_controlada:
@@ -346,6 +482,8 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             recomendacion="Enfermedad o condición no controlada: se desaconseja avanzar sin control médico previo.",
             derivacion_sugerida="médico clínico",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R3")],
+            explicacion_conclusion=_explicacion_texto_corte("R3", "no apto preliminarmente", "alto"),
         )
 
     if mt.consume_drogas:
@@ -357,6 +495,8 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             recomendacion="Consumo de drogas: caso de alta alerta; no avanzar sin evaluación profesional.",
             derivacion_sugerida="médico clínico / psicólogo",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R4")],
+            explicacion_conclusion=_explicacion_texto_corte("R4", "no apto preliminarmente", "alto"),
         )
 
     if mt.estado_psicologico == "inestable":
@@ -368,6 +508,8 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             recomendacion="Inestabilidad psicológica relevante: se recomienda evaluación psicológica antes de continuar.",
             derivacion_sugerida="psicólogo",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R5")],
+            explicacion_conclusion=_explicacion_texto_corte("R5", "no apto preliminarmente", "alto"),
         )
 
     if mt.expectativas == "irreales":
@@ -380,6 +522,8 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             "y resultados posibles.",
             derivacion_sugerida="psicólogo / cirujano plástico",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R6")],
+            explicacion_conclusion=_explicacion_texto_corte("R6", "no apto preliminarmente", "alto"),
         )
 
     if _es_salud_mala(mt.estado_general_salud):
@@ -391,9 +535,11 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             recomendacion="Estado general de salud malo: se requiere evaluación y optimización médica previa.",
             derivacion_sugerida="médico clínico",
             reglas_activadas=reglas,
+            reglas_explicadas=[_regla_activada_corte_domino("R7")],
+            explicacion_conclusion=_explicacion_texto_corte("R7", "no apto preliminarmente", "alto"),
         )
 
-    # ----- Fase 3–5: motor difuso (centroide) + reglas moderadas R21–R22 -----
+    # ----- Fase 3–5: motor difuso (Mamdani + centroide) y postproceso R21–R22 -----
     sim = _obtener_simulacion()
     sim.input["edad"] = float(mt.edad)
     sim.input["imc"] = float(mt.imc)
@@ -417,7 +563,7 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
     nivel = _riesgo_categoria_documento(riesgo_ajustado)
     aptitud = _clasificacion_aptitud_sin_criticos(riesgo_ajustado, nivel, moderados)
 
-    # Reglas activadas (trazabilidad)
+    # Trazas simbólicas de dominio (R8–R22) y etiqueta de fase del motor
     reglas.append("Fase3-Fase5-difuso")
     if moderados >= 3:
         reglas.append("R22")
@@ -456,7 +602,64 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
     if mt.procedimiento_deseado == "ambos" and moderados >= 2:
         reglas.append("R20")
 
-    # Recomendación textual
+    # Reglas difusas con grado de disparo (lectura post ``compute``)
+    disparos_df = disparos_difusos_desde_simulacion(sim)
+    for codigo_df, _ in disparos_df:
+        reglas.append(codigo_df)
+
+    codigos_ordenados = sorted(set(reglas), key=_orden_codigo_regla)
+
+    # ----- Subsistema de explicación: lista estructurada + párrafo «por qué» -----
+    explicadas: list[ReglaActivada] = [
+        ReglaActivada(
+            codigo="FASE3-5",
+            categoria="informacion",
+            descripcion="Ejecución del controlador difuso (fuzzificación, reglas Mamdani, defuzzificación por centroide).",
+        )
+    ]
+    for codigo_df, grado in disparos_df:
+        explicadas.append(
+            ReglaActivada(
+                codigo=codigo_df,
+                categoria="difusa_mamdani",
+                descripcion=descripcion_difusa(codigo_df),
+                grado_activacion=round(grado, 4),
+            )
+        )
+    if "R21" in reglas:
+        explicadas.append(
+            ReglaActivada(
+                codigo="R21",
+                categoria="postproceso_numerico",
+                descripcion=descripcion_dominio("R21"),
+            )
+        )
+    if "R22" in reglas:
+        explicadas.append(
+            ReglaActivada(
+                codigo="R22",
+                categoria="postproceso_numerico",
+                descripcion=descripcion_dominio("R22"),
+            )
+        )
+    traza_rs = sorted(
+        (r for r in reglas if r.startswith("R") and r not in ("R21", "R22")),
+        key=lambda z: int(z[1:]),
+    )
+    for tr in traza_rs:
+        explicadas.append(
+            ReglaActivada(
+                codigo=tr,
+                categoria="trazabilidad_dominio",
+                descripcion=descripcion_dominio(tr),
+            )
+        )
+
+    explicacion = _explicacion_texto_difuso(
+        aptitud, nivel, riesgo_ajustado, moderados, disparos_df, traza_rs
+    )
+
+    # ----- Recomendación textual (mensajes orientativos para el usuario final) -----
     if nivel == "bajo":
         recomendaciones.append(
             "Riesgo bajo según factores graduales y reglas moderadas. Puede avanzar hacia una evaluación médica formal."
@@ -503,13 +706,15 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
         nivel_riesgo_numerico=round(riesgo_ajustado, 2),
         recomendacion=" ".join(recomendaciones),
         derivacion_sugerida=derivacion,
-        reglas_activadas=sorted(set(reglas), key=lambda x: (x[0] != "R", x)),
+        reglas_activadas=codigos_ordenados,
+        reglas_explicadas=explicadas,
+        explicacion_conclusion=explicacion,
     )
 
 
 @app.get("/")
 def raiz() -> dict[str, str]:
-    """La raíz no evalúa pacientes; la prueba interactiva está en /docs."""
+    """Expone metadatos mínimos; la evaluación clínica vive en ``POST /evaluar``."""
     return {
         "mensaje": "Sistema Experto API activa.",
         "probar_interfaz": "/docs",
@@ -520,9 +725,11 @@ def raiz() -> dict[str, str]:
 
 @app.post("/evaluar", response_model=EvaluacionResultado)
 def endpoint_evaluar(memoria: MemoriaTrabajo) -> EvaluacionResultado:
+    """Endpoint principal: transforma la memoria de trabajo en conclusión explicada."""
     return evaluar_paciente(memoria)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    """Comprobación liviana para balanceadores o scripts de despliegue."""
     return {"status": "ok"}
