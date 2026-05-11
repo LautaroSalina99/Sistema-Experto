@@ -2,14 +2,12 @@ import * as Tabs from '@radix-ui/react-tabs'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import {
-  estabilidadCRISP,
   expectativasCRISP,
   fuzzifyEdad,
   fuzzifyEstabilidad,
   fuzzifyExpectativas,
   fuzzifyImc,
   fuzzifySalud,
-  saludCRISP,
   type LabeledDegree,
 } from './fuzzMath'
 import { cn } from './lib/utils'
@@ -20,8 +18,8 @@ export type MemoriaTrabajoPayload = {
   edad: number
   procedimiento_deseado: 'abdominoplastía' | 'liposucción' | 'ambos'
   imc: number
-  estabilidad_peso: 'estable' | 'poco estable' | 'inestable'
-  estado_general_salud: 'bueno' | 'regular' | 'malo'
+  estabilidad_peso: number
+  estado_general_salud: number
   enfermedad_no_controlada: boolean
   tabaquismo: boolean
   consume_drogas: boolean
@@ -29,7 +27,7 @@ export type MemoriaTrabajoPayload = {
     | 'sin antecedentes'
     | 'cirugía previa sin complicaciones'
     | 'cirugía previa con complicaciones'
-  cicatrizacion: 'normal' | 'mala'
+  cicatrizacion: number
   estado_psicologico: 'estable' | 'dudoso' | 'inestable'
   expectativas: 'realistas' | 'poco claras' | 'irreales'
   informacion_completa: boolean
@@ -56,13 +54,13 @@ const defaultForm: MemoriaTrabajoPayload = {
   edad: 38,
   procedimiento_deseado: 'abdominoplastía',
   imc: 29,
-  estabilidad_peso: 'poco estable',
-  estado_general_salud: 'regular',
+  estabilidad_peso: 5,
+  estado_general_salud: 8,
   enfermedad_no_controlada: false,
   tabaquismo: true,
   consume_drogas: false,
   antecedentes_quirurgicos: 'cirugía previa sin complicaciones',
-  cicatrizacion: 'normal',
+  cicatrizacion: 3,
   estado_psicologico: 'estable',
   expectativas: 'realistas',
   informacion_completa: true,
@@ -190,6 +188,8 @@ function buildInferenceSteps(
     },
   ]
 }
+
+const scaleOptions = Array.from({ length: 10 }, (_, i) => i + 1)
 
 function ruleChipClass(rule: string): string {
   if (/^R[2-7]$/.test(rule)) return 'border-red-200 bg-red-50 text-red-800'
@@ -327,8 +327,8 @@ export default function App() {
   const fuzzPanels = useMemo(() => {
     const edad = fuzzifyEdad(form.edad)
     const imc = fuzzifyImc(form.imc)
-    const est = fuzzifyEstabilidad(estabilidadCRISP(form.estabilidad_peso))
-    const sal = fuzzifySalud(saludCRISP(form.estado_general_salud))
+    const est = fuzzifyEstabilidad(form.estabilidad_peso)
+    const sal = fuzzifySalud(form.estado_general_salud)
     const exp = fuzzifyExpectativas(expectativasCRISP(form.expectativas))
     return { edad, imc, est, sal, exp }
   }, [form])
@@ -465,38 +465,42 @@ export default function App() {
                   </label>
 
                   <label className="flex flex-col gap-1.5 text-sm">
-                    <span className="font-medium text-slate-700">Estabilidad del peso</span>
+                    <span className="font-medium text-slate-700">Estabilidad del peso (1 estable - 10 inestable)</span>
                     <select
                       value={form.estabilidad_peso}
                       onChange={(e) =>
                         setForm((f) => ({
                           ...f,
-                          estabilidad_peso: e.target.value as MemoriaTrabajoPayload['estabilidad_peso'],
+                          estabilidad_peso: Number(e.target.value),
                         }))
                       }
                       className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-slate-900 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
                     >
-                      <option value="estable">Estable</option>
-                      <option value="poco estable">Poco estable</option>
-                      <option value="inestable">Inestable</option>
+                      {scaleOptions.map((v) => (
+                        <option key={v} value={v}>
+                          {v}
+                        </option>
+                      ))}
                     </select>
                   </label>
 
                   <label className="flex flex-col gap-1.5 text-sm">
-                    <span className="font-medium text-slate-700">Estado general de salud</span>
+                    <span className="font-medium text-slate-700">Estado general de salud (1 malo - 10 bueno)</span>
                     <select
                       value={form.estado_general_salud}
                       onChange={(e) =>
                         setForm((f) => ({
                           ...f,
-                          estado_general_salud: e.target.value as MemoriaTrabajoPayload['estado_general_salud'],
+                          estado_general_salud: Number(e.target.value),
                         }))
                       }
                       className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-slate-900 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
                     >
-                      <option value="bueno">Bueno</option>
-                      <option value="regular">Regular</option>
-                      <option value="malo">Malo</option>
+                      {scaleOptions.map((v) => (
+                        <option key={v} value={v}>
+                          {v}
+                        </option>
+                      ))}
                     </select>
                   </label>
 
@@ -520,19 +524,22 @@ export default function App() {
                   </label>
 
                   <label className="flex flex-col gap-1.5 text-sm">
-                    <span className="font-medium text-slate-700">Cicatrización</span>
+                    <span className="font-medium text-slate-700">Cicatrización (1 normal - 10 mala)</span>
                     <select
                       value={form.cicatrizacion}
                       onChange={(e) =>
                         setForm((f) => ({
                           ...f,
-                          cicatrizacion: e.target.value as MemoriaTrabajoPayload['cicatrizacion'],
+                          cicatrizacion: Number(e.target.value),
                         }))
                       }
                       className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-slate-900 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
                     >
-                      <option value="normal">Normal</option>
-                      <option value="mala">Mala</option>
+                      {scaleOptions.map((v) => (
+                        <option key={v} value={v}>
+                          {v}
+                        </option>
+                      ))}
                     </select>
                   </label>
 
@@ -735,17 +742,17 @@ export default function App() {
                   <h2 className="text-lg font-semibold text-slate-900">Fuzzificación (membresía)</h2>
                   <p className="mt-1 text-sm text-slate-600">
                     Visualización local de μ con los mismos parámetros triangulares/trapezoidales del informe. Los valores
-                    categóricos se proyectan a escala 0–10 como en el backend Python.
+                    de la escala se usan de forma directa (1 a 10), como en el backend Python.
                   </p>
                   <div className="mt-6 grid gap-4 sm:grid-cols-1">
                     <MembershipBars title={`Edad (${form.edad} años)`} rows={fuzzPanels.edad} />
                     <MembershipBars title={`IMC (${form.imc})`} rows={fuzzPanels.imc} />
                     <MembershipBars
-                      title={`Estabilidad del peso → escala (${estabilidadCRISP(form.estabilidad_peso).toFixed(1)}/10)`}
+                      title={`Estabilidad del peso → escala (${form.estabilidad_peso.toFixed(1)}/10)`}
                       rows={fuzzPanels.est}
                     />
                     <MembershipBars
-                      title={`Estado de salud → escala (${saludCRISP(form.estado_general_salud).toFixed(1)}/10)`}
+                      title={`Estado de salud → escala (${form.estado_general_salud.toFixed(1)}/10)`}
                       rows={fuzzPanels.sal}
                     />
                     <MembershipBars

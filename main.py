@@ -19,14 +19,11 @@ from skfuzzy import control as ctrl
 # --- Constantes de dominio (literales del documento) ---
 
 Procedimiento = Literal["abdominoplastía", "liposucción", "ambos"]
-EstabilidadPeso = Literal["estable", "poco estable", "inestable"]
-EstadoSalud = Literal["bueno", "regular", "malo"]
 AntecedentesQx = Literal[
     "sin antecedentes",
     "cirugía previa sin complicaciones",
     "cirugía previa con complicaciones",
 ]
-Cicatrizacion = Literal["normal", "mala"]
 EstadoPsicologico = Literal["estable", "dudoso", "inestable"]
 Expectativas = Literal["realistas", "poco claras", "irreales"]
 Aptitud = Literal[
@@ -44,13 +41,13 @@ class MemoriaTrabajo(BaseModel):
     edad: int = Field(..., ge=0, le=120)
     procedimiento_deseado: Procedimiento
     imc: float = Field(..., ge=0, le=60)
-    estabilidad_peso: EstabilidadPeso
-    estado_general_salud: EstadoSalud
+    estabilidad_peso: int = Field(..., ge=1, le=10)
+    estado_general_salud: int = Field(..., ge=1, le=10)
     enfermedad_no_controlada: bool
     tabaquismo: bool
     consume_drogas: bool
     antecedentes_quirurgicos: AntecedentesQx
-    cicatrizacion: Cicatrizacion
+    cicatrizacion: int = Field(..., ge=1, le=10)
     estado_psicologico: EstadoPsicologico
     expectativas: Expectativas
     informacion_completa: bool
@@ -84,14 +81,29 @@ app.add_middleware(
 )
 
 
-def _estabilidad_a_escala(estabilidad: EstabilidadPeso) -> float:
-    """Escala 0–10: 0 estable, 10 muy inestable (documento)."""
-    return {"estable": 1.0, "poco estable": 5.0, "inestable": 9.0}[estabilidad]
+def _es_salud_mala(valor: int) -> bool:
+    """1..10 donde valores bajos representan peor estado general."""
+    return valor <= 3
 
 
-def _salud_a_escala(salud: EstadoSalud) -> float:
-    """Escala 0–10: 0 malo, 10 bueno (documento)."""
-    return {"malo": 1.5, "regular": 5.0, "bueno": 9.0}[salud]
+def _es_peso_inestable(valor: int) -> bool:
+    """1..10 donde valores altos representan mayor inestabilidad."""
+    return valor >= 8
+
+
+def _es_peso_poco_estable(valor: int) -> bool:
+    """Rango intermedio de estabilidad de peso."""
+    return 4 <= valor <= 7
+
+
+def _cicatrizacion_mala_factor(valor: int) -> float:
+    """Mapea 1..10 (normal→mala) a factor difuso [0..1]."""
+    return float(np.clip((valor - 1) / 9, 0.0, 1.0))
+
+
+def _es_cicatrizacion_mala(valor: int) -> bool:
+    """Umbral clínico heurístico para etiquetas/reglas discretas."""
+    return valor >= 6
 
 
 def _expectativas_a_escala(exp: Expectativas) -> float:
@@ -251,13 +263,13 @@ def _contar_factores_moderados(mt: MemoriaTrabajo) -> int:
         n += 1
     if mt.imc >= 25.0:
         n += 1
-    if mt.estabilidad_peso in ("poco estable", "inestable"):
+    if mt.estabilidad_peso >= 4:
         n += 1
-    if mt.estado_general_salud == "regular":
+    if 4 <= mt.estado_general_salud <= 7:
         n += 1
     if mt.antecedentes_quirurgicos == "cirugía previa con complicaciones":
         n += 1
-    if mt.cicatrizacion == "mala":
+    if _es_cicatrizacion_mala(mt.cicatrizacion):
         n += 1
     if mt.estado_psicologico == "dudoso":
         n += 1
@@ -370,7 +382,7 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
             reglas_activadas=reglas,
         )
 
-    if mt.estado_general_salud == "malo":
+    if _es_salud_mala(mt.estado_general_salud):
         reglas.append("R7")
         return EvaluacionResultado(
             aptitud_preliminar="no apto preliminarmente",
@@ -385,14 +397,14 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
     sim = _obtener_simulacion()
     sim.input["edad"] = float(mt.edad)
     sim.input["imc"] = float(mt.imc)
-    sim.input["estabilidad"] = _estabilidad_a_escala(mt.estabilidad_peso)
-    sim.input["salud"] = _salud_a_escala(mt.estado_general_salud)
+    sim.input["estabilidad"] = float(mt.estabilidad_peso)
+    sim.input["salud"] = float(mt.estado_general_salud)
     sim.input["expectativas"] = _expectativas_a_escala(mt.expectativas)
     sim.input["tabaco"] = 1.0 if mt.tabaquismo else 0.0
     sim.input["complicaciones_qx"] = (
         1.0 if mt.antecedentes_quirurgicos == "cirugía previa con complicaciones" else 0.0
     )
-    sim.input["cicatriz_mala"] = 1.0 if mt.cicatrizacion == "mala" else 0.0
+    sim.input["cicatriz_mala"] = _cicatrizacion_mala_factor(mt.cicatrizacion)
     sim.input["proc_abdom"] = (
         1.0 if mt.procedimiento_deseado in ("abdominoplastía", "ambos") else 0.0
     )
@@ -417,25 +429,25 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
         reglas.append("R9")
     if mt.imc >= 35:
         reglas.append("R10")
-    if mt.estabilidad_peso == "poco estable":
+    if _es_peso_poco_estable(mt.estabilidad_peso):
         reglas.append("R11")
-    if mt.estabilidad_peso == "inestable":
+    if _es_peso_inestable(mt.estabilidad_peso):
         reglas.append("R12")
     if mt.antecedentes_quirurgicos == "cirugía previa con complicaciones":
         reglas.append("R13")
-    if mt.cicatrizacion == "mala":
+    if _es_cicatrizacion_mala(mt.cicatrizacion):
         reglas.append("R14")
     if mt.estado_psicologico == "dudoso":
         reglas.append("R15")
     if mt.expectativas == "poco claras":
         reglas.append("R16")
-    if mt.procedimiento_deseado in ("abdominoplastía", "ambos") and mt.estabilidad_peso == "inestable":
+    if mt.procedimiento_deseado in ("abdominoplastía", "ambos") and _es_peso_inestable(mt.estabilidad_peso):
         reglas.append("R17")
-    if mt.procedimiento_deseado in ("abdominoplastía", "ambos") and mt.cicatrizacion == "mala":
+    if mt.procedimiento_deseado in ("abdominoplastía", "ambos") and _es_cicatrizacion_mala(mt.cicatrizacion):
         reglas.append("R18")
     if (
         mt.procedimiento_deseado == "liposucción"
-        and mt.estado_general_salud == "bueno"
+        and mt.estado_general_salud >= 8
         and mt.imc <= 30
         and mt.expectativas == "realistas"
         and nivel == "bajo"
@@ -460,7 +472,7 @@ def evaluar_paciente(mt: MemoriaTrabajo) -> EvaluacionResultado:
 
     if mt.tabaquismo:
         recomendaciones.append("Suspender tabaquismo según indicación profesional previa a cirugía (R8).")
-    if mt.estabilidad_peso == "inestable":
+    if _es_peso_inestable(mt.estabilidad_peso):
         recomendaciones.append(
             "Priorizar estabilización del peso antes de una evaluación quirúrgica, especialmente en abdominoplastía (R12/R17)."
         )

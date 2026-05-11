@@ -39,14 +39,6 @@ export function fuzzifyImc(imc: number): LabeledDegree[] {
   return pairs.map(([label, mu]) => ({ label, mu }))
 }
 
-/** Escala 0–10: 0 estable, 10 muy inestable (coincide con backend). */
-export function estabilidadCRISP(
-  estabilidad: 'estable' | 'poco estable' | 'inestable',
-): number {
-  const m = { estable: 1.0, 'poco estable': 5.0, inestable: 9.0 }
-  return m[estabilidad]
-}
-
 export function fuzzifyEstabilidad(v: number): LabeledDegree[] {
   const pairs: [string, number][] = [
     ['Estable', trapmf(v, [0, 0, 2, 4])],
@@ -54,12 +46,6 @@ export function fuzzifyEstabilidad(v: number): LabeledDegree[] {
     ['Inestable', trapmf(v, [6, 8, 10, 10])],
   ]
   return pairs.map(([label, mu]) => ({ label, mu }))
-}
-
-/** Escala 0–10: 0 malo, 10 bueno. */
-export function saludCRISP(salud: 'bueno' | 'regular' | 'malo'): number {
-  const m = { malo: 1.5, regular: 5.0, bueno: 9.0 }
-  return m[salud]
 }
 
 export function fuzzifySalud(v: number): LabeledDegree[] {
